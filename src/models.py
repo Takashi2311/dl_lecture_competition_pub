@@ -2,27 +2,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
+from torchvision import models
 
 
-class BasicConvClassifier(nn.Module):
+class BasicTransformerClassifier(nn.Module):
     def __init__(
         self,
         num_classes: int,
         seq_len: int,
         in_channels: int,
-        hid_dim: int = 128
+        hid_dim: int = 128,
+        num_head: int = 8,
+        num_layers: int = 4,
+        dropout: float = 0.3
     ) -> None:
         super().__init__()
 
-        self.blocks = nn.Sequential(
-            ConvBlock(in_channels, hid_dim),
-            ConvBlock(hid_dim, hid_dim),
-        )
-
+        self.conv1 = nn.Conv1d(in_channels, hid_dim, kernel_size=3, padding=1)
+        self.pos_encoder = Position(hid_dim, len=seq_len)
+        encoder_layers = nn.TransformerEncoderLayer(d_model=hid_dim, nhead=num_head, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         self.head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            Rearrange("b d 1 -> b d"),
-            nn.Linear(hid_dim, num_classes),
+            nn.Linear(hid_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),  # ドロップアウトで正則化
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
@@ -32,45 +36,37 @@ class BasicConvClassifier(nn.Module):
         Returns:
             X ( b, num_classes ): _description_
         """
-        X = self.blocks(X)
+        X = self.conv1(X)
+        X = X.permute(2, 0, 1)
+        X = self.pos_encoder(X)
+        eeg_features = self.transformer_encoder(X)
+        eeg_features = eeg_features.mean(dim=0)
 
-        return self.head(X)
+        return self.head(eeg_features)
 
-
-class ConvBlock(nn.Module):
-    def __init__(
-        self,
-        in_dim,
-        out_dim,
-        kernel_size: int = 3,
-        p_drop: float = 0.1,
-    ) -> None:
+class Position(nn.Module):
+    def __init__(self, d_model, len=10000):
         super().__init__()
-        
-        self.in_dim = in_dim
-        self.out_dim = out_dim
+        pe = torch.zeros(len, d_model)
+        position = torch.arange(0, len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1)
+        self.register_buffer('pe', pe)
 
-        self.conv0 = nn.Conv1d(in_dim, out_dim, kernel_size, padding="same")
-        self.conv1 = nn.Conv1d(out_dim, out_dim, kernel_size, padding="same")
-        # self.conv2 = nn.Conv1d(out_dim, out_dim, kernel_size) # , padding="same")
-        
-        self.batchnorm0 = nn.BatchNorm1d(num_features=out_dim)
-        self.batchnorm1 = nn.BatchNorm1d(num_features=out_dim)
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
 
-        self.dropout = nn.Dropout(p_drop)
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        if self.in_dim == self.out_dim:
-            X = self.conv0(X) + X  # skip connection
-        else:
-            X = self.conv0(X)
-
-        X = F.gelu(self.batchnorm0(X))
-
-        X = self.conv1(X) + X  # skip connection
-        X = F.gelu(self.batchnorm1(X))
-
-        # X = self.conv2(X)
-        # X = F.glu(X, dim=-2)
-
-        return self.dropout(X)
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, d_model)
+        Returns:
+            Tensor with positional encodings added, shape (batch_size, seq_len, d_model)
+        """
+        # Add positional encoding to input tensor
+        x = x + self.pe[:, :x.size(1)]
+        return x
